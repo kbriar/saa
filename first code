@@ -1,0 +1,137 @@
+ !pip install -q \
+    torch torchvision torchaudio \
+    sentence-transformers faiss-cpu scikit-learn pandas \
+    langchain langchain-community langchain-google-vertexai google-cloud-aiplatform \
+    huggingface_hub[hf_xet]
+# Colab Cell 2: Upload credentials + data, then run agentic AI app
+
+import os
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+
+from google.colab import files
+import pandas as pd
+import numpy as np
+import faiss
+from sentence_transformers import SentenceTransformer
+from sklearn.linear_model import LinearRegression
+from typing import List, Dict
+# LangChain + Vertex AI (Gemini)
+from langchain.chat_models import ChatVertexAI
+from langchain.agents import initialize_agent, Tool, AgentType
+from langchain_google_vertexai import VertexAI
+
+
+print("▶ Upload your GCP service-account JSON")
+sa = files.upload()
+sa_fname = next(iter(sa))
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = sa_fname
+
+# 1️⃣ Load & preprocess data
+print("1/6 ▶ Loading & preprocessing data…")
+acc1 = pd.read_csv('accidents_2005_to_2007.csv', low_memory=False)
+acc2 = pd.read_csv('accidents_2009_to_2011.csv', low_memory=False)
+acc3 = pd.read_csv('accidents_2012_to_2014.csv', low_memory=False)
+aadf = pd.read_csv('ukTrafficAADF.csv',               low_memory=False)
+aadf.columns = aadf.columns.str.strip()
+
+acc_df = pd.concat([acc1, acc2, acc3], ignore_index=True)
+acc_df.dropna(subset=['Date','Location_Easting_OSGR','Location_Northing_OSGR'], inplace=True)
+acc_df['Date'] = pd.to_datetime(acc_df['Date'], errors='coerce')
+acc_df.dropna(subset=['Date'], inplace=True)
+
+# Optional CPU speed-up
+acc_df = acc_df.sample(n=20000, random_state=42)
+
+acc_df['text'] = acc_df.apply(
+    lambda r: f"Accident at ({r['Location_Easting_OSGR']}, {r['Location_Northing_OSGR']}) on "
+              f"{r['Date'].strftime('%Y-%m-%d')} – Severity: {r.get('Accident_Severity','Unknown')}",
+    axis=1
+)
+aadf['text'] = aadf.apply(
+    lambda r: f"AADF for road {r['Road']} at {r['LocalAuthority']} (CP: {r['CP']}): "
+              f"{r['AllMotorVehicles']} vehicles per day",
+    axis=1
+)
+
+all_texts = acc_df['text'].tolist() + aadf['text'].tolist()
+metadata  = (
+    acc_df[['Location_Easting_OSGR','Location_Northing_OSGR','Date']]
+         .to_dict(orient='records')
+  + aadf[['Road','LocalAuthority','AllMotorVehicles']]
+         .to_dict(orient='records')
+)
+
+# 2️⃣ Embed & FAISS index
+print("2/6 ▶ Embedding + FAISS indexing…")
+embed_model = SentenceTransformer('all-MiniLM-L6-v2')
+embs = embed_model.encode(all_texts, convert_to_numpy=True, show_progress_bar=True)
+dim   = embs.shape[1]
+index = faiss.IndexFlatL2(dim)
+index.add(embs)
+
+# 3️⃣ Semantic search & prediction helpers
+def semantic_search_with_metadata(query: str, k: int = 5) -> List[Dict]:
+    qv, = embed_model.encode([query], convert_to_numpy=True)
+    dists, idxs = index.search(np.array([qv]), k)
+    out = []
+    for dist, idx in zip(dists[0], idxs[0]):
+        out.append({
+            'text':             all_texts[idx],
+            'metadata':         metadata[idx],
+            'distance':         float(dist),
+            'confidence_score': float(1/(1+dist))
+        })
+    return out
+
+def predict_next_month_accidents(df: pd.DataFrame) -> int:
+    df2 = df.copy()
+    df2['Date'] = pd.to_datetime(df2['Date'], errors='coerce')
+    monthly = (df2.groupby(df2['Date'].dt.to_period('M'))
+                .size().reset_index(name='accidents'))
+    monthly['month_num'] = range(len(monthly))
+    X = monthly[['month_num']]
+    y = monthly['accidents']
+    lr = LinearRegression().fit(X, y)
+    next_mon = X['month_num'].max() + 1
+    return int(lr.predict([[next_mon]])[0])
+
+# 4️⃣ LangChain Tools
+def semantic_tool(q: str) -> str:
+    res = semantic_search_with_metadata(q, k=3)
+    lines = [f"- {r['text']}  (Conf: {r['confidence_score']:.3f})" for r in res]
+    return "Top Matches:\n" + "\n".join(lines) + f"\n\nAnswer: {res[0]['text']}"
+
+def predict_tool(_: str) -> str:
+    return f"📊 Predicted accidents next month: {predict_next_month_accidents(acc_df)}"
+
+tools = [
+    Tool("SemanticSearch", semantic_tool, "Query past accident/AADF data"),
+    Tool("PredictAccidents",  predict_tool,  "Forecast next month's accidents")
+]
+
+# 5️⃣ Initialize Google Gemini via Vertex AI
+print("5/6 ▶ Initializing ChatVertexAI (Gemini)…")
+from langchain_google_vertexai import ChatVertexAI  # or the updated class name
+llm = ChatVertexAI(
+    model_name="gemini-2.0-flash-001",
+    project="gen-lang-client-0067606634",
+    location="us-central1",
+    temperature=0,
+)
+
+agent = initialize_agent(
+    tools, llm,
+    agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+    verbose=True
+)
+
+# 6️⃣ Run sample queries
+print("6/6 ▶ Running sample queries…")
+for q in [
+    "What is the AADF for road A405?",
+    "How many accidents will happen next two month?",
+    "Where did the most accidents occur in 2011?"
+]:
+    print(f"\n>>> Q: {q}")
+    print(agent.invoke({"input": q})["output"])
